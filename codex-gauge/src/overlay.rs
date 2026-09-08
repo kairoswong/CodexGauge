@@ -2,6 +2,7 @@
 //! Borderless, always-on-top, not shown in taskbar.
 
 use std::sync::Arc;
+use std::{env, fs};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -57,13 +58,32 @@ fn cached_font(slot: &'static std::sync::OnceLock<AppFont>, height: i32, weight:
 
 pub fn set_quota(q: Quota) {
     if let Some(m) = QUOTA.get() {
-        *m.lock().unwrap() = q;
+        let changed = {
+            let mut current = m.lock().unwrap();
+            if *current == q {
+                false
+            } else {
+                *current = q.clone();
+                true
+            }
+        };
+        if changed && q.connected {
+            save_cached_quota(&q);
+        }
     }
+}
+
+pub fn current_quota() -> Quota {
+    QUOTA
+        .get()
+        .and_then(|m| m.lock().ok().map(|q| q.clone()))
+        .unwrap_or_default()
 }
 
 /// Create the overlay window at the bottom-right of the primary screen.
 pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
-    let _ = QUOTA.set(Arc::new(std::sync::Mutex::new(Quota::disconnected())));
+    let initial = load_cached_quota().unwrap_or_else(Quota::disconnected);
+    let _ = QUOTA.set(Arc::new(std::sync::Mutex::new(initial)));
 
     // Determine primary screen working area to place the widget.
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -107,6 +127,26 @@ pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
     }
 
     Ok(Overlay { hwnd })
+}
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    Some(env::var_os("APPDATA").map(std::path::PathBuf::from)?.join("CodexGauge"))
+}
+
+fn load_cached_quota() -> Option<Quota> {
+    let path = cache_path()?.join("quota.json");
+    let quota: Quota = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    quota.connected.then_some(quota)
+}
+
+fn save_cached_quota(quota: &Quota) {
+    let Some(dir) = cache_path() else { return };
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(data) = serde_json::to_vec(quota) {
+        let _ = fs::write(dir.join("quota.json"), data);
+    }
 }
 
 extern "system" fn overlay_wndproc(

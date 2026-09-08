@@ -1,7 +1,7 @@
 //! Quota data model shared between the app-server reader and the UI.
 
 /// One rate-limit window (e.g. the 5-hour window or the weekly window).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Window {
     /// Percentage of quota already used (0.0 ..= 100.0).
     pub used_percent: f64,
@@ -24,7 +24,7 @@ impl Window {
 }
 
 /// Normalized quota snapshot used by the overlay.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Quota {
     /// Short window (usually 5 hours).
     pub primary: Option<Window>,

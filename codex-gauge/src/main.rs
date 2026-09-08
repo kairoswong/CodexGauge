@@ -18,11 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use crate::quota::Quota;
-
-const REFRESH_MS: u32 = 300_000; // 5 min
+const REFRESH_MS: u32 = 300_000; // stable fallback: 5 min
 const STARTUP_DELAY_MS: u32 = 100;
 const RETRY_MS: u32 = 2_000; // fast retry after a failed refresh
+const CACHED_RETRY_MS: u32 = 30_000;
+const ACTIVE_REFRESH_MS: u32 = 30_000;
+const STABLE_REFRESH_MS: [u32; 4] = [120_000, 300_000, 900_000, 1_800_000];
 const TIMER_REFRESH: usize = 1;
 const TIMER_STARTUP: usize = 2;
 const TIMER_WAKE_REFRESH: usize = 3;
@@ -71,10 +72,11 @@ fn main() -> Result<()> {
     unsafe { let _ = UpdateWindow(overlay.hwnd); };
 
     unsafe { SetTimer(bus, TIMER_STARTUP, STARTUP_DELAY_MS, None) }; // refresh shortly after startup
-    unsafe { SetTimer(bus, TIMER_REFRESH, REFRESH_MS, None) }; // periodic
+    unsafe { SetTimer(bus, TIMER_REFRESH, REFRESH_MS, None) }; // periodic fallback
 
     // Consecutive failed refreshes; reset on success to bound fast retries.
     let mut consecutive_failures: u32 = 0;
+    let mut unchanged_successes: usize = 0;
 
     let mut msg = MSG::default();
     loop {
@@ -98,12 +100,35 @@ fn main() -> Result<()> {
                 // genuinely absent; the slow 5-min timer takes over after that.
                 if msg.wParam.0 == 0 {
                     consecutive_failures += 1;
+                    let retry_ms = if overlay::current_quota().connected {
+                        CACHED_RETRY_MS
+                    } else {
+                        RETRY_MS
+                    };
                     if consecutive_failures <= MAX_CONSECUTIVE_RETRIES {
-                        unsafe { let _ = SetTimer(bus, TIMER_RETRY, RETRY_MS, None); };
+                        unsafe { let _ = SetTimer(bus, TIMER_RETRY, retry_ms, None); };
                     }
                 } else {
                     consecutive_failures = 0;
-                    unsafe { let _ = KillTimer(bus, TIMER_RETRY); };
+                    let changed = msg.wParam.0 == 2;
+                    unchanged_successes = if changed {
+                        0
+                    } else {
+                        unchanged_successes.saturating_add(1)
+                    };
+                    let interval = if changed {
+                        ACTIVE_REFRESH_MS
+                    } else {
+                        STABLE_REFRESH_MS
+                            .get(unchanged_successes.saturating_sub(1))
+                            .copied()
+                            .unwrap_or(REFRESH_MS)
+                    };
+                    unsafe {
+                        let _ = KillTimer(bus, TIMER_RETRY);
+                        let _ = KillTimer(bus, TIMER_REFRESH);
+                        let _ = SetTimer(bus, TIMER_REFRESH, interval, None);
+                    }
                 }
             }
             WM_TIMER => {
@@ -233,18 +258,20 @@ fn refresh_async(bus: HWND, overlay: HWND) {
     // Fetch off the UI thread, then repaint.
     std::thread::spawn(move || {
         let result = appserver::fetch_quota_async();
-        let quota = match &result {
-            Ok(q) => q.clone(),
-            Err(_) => Quota::disconnected(),
+        let status = match &result {
+            Ok(quota) => {
+                let changed = overlay::current_quota() != *quota;
+                overlay::set_quota(quota.clone());
+                if changed { 2 } else { 1 }
+            }
+            Err(_) => 0,
         };
-        overlay::set_quota(quota);
         let hwnd = HWND(overlay_bits as *mut std::ffi::c_void);
         unsafe {
             let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
         }
-        // Tell the main thread whether to schedule a fast retry. 0 = failed
-        // (reconnect soon), 1 = succeeded (no outstanding retry needed).
-        let ok = if result.is_ok() { WPARAM(1) } else { WPARAM(0) };
+        // Tell the main thread whether the fetch failed, was unchanged, or
+        // returned new data: 0 = failed, 1 = unchanged, 2 = changed.
         unsafe {
             // Cached bus HWND; fall back to posting to the overlay if unset.
             let target = if bus_bits != 0 {
@@ -252,7 +279,7 @@ fn refresh_async(bus: HWND, overlay: HWND) {
             } else {
                 hwnd
             };
-            let _ = PostMessageW(target, WM_APP_RETRY, ok, LPARAM(0));
+            let _ = PostMessageW(target, WM_APP_RETRY, WPARAM(status), LPARAM(0));
         }
         // Clear the in-flight flag so the next tick can fetch again.
         REFRESH_IN_FLIGHT.store(false, Ordering::Release);
