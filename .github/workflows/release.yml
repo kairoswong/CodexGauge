@@ -56,9 +56,47 @@ jobs:
           cp codex-gauge/target/release/codex-gauge.exe \
              "dist/codex-gauge-${{ steps.meta.outputs.VERSION }}-x86_64-pc-windows-msvc.exe"
 
-      # Upload the exe to the Release for this tag
+      # Build structured release notes from Conventional Commits since the last
+      # tag (e.g. "feat: ..." -> ### Added). Falls back to a plain commit list.
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          echo "## What's Changed" > NOTES.md
+          # Most recent tag visible from the previous commit (empty for the
+          # very first release), plus the current tag.
+          LAST_TAG=$(git describe --abbrev=0 --tags HEAD~1 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ] && [ "$LAST_TAG" != "${{ github.ref_name }}" ]; then
+            LOG=$(git log "$LAST_TAG"..HEAD --pretty=format:'%s' --no-merges 2>/dev/null || true)
+          else
+            LOG=$(git log --pretty=format:'%s' --no-merges 2>/dev/null || true)
+          fi
+          if [ -n "$LOG" ]; then
+            {
+              echo ""
+              echo '### Added'
+              echo "$LOG" | grep -iE '^feat' || true
+              echo ""
+              echo '### Fixed'
+              echo "$LOG" | grep -iE '^fix' || true
+              echo ""
+              echo '### Changed'
+              echo "$LOG" | grep -iE '^(refactor|perf|style)' || true
+              echo ""
+              echo '### Docs'
+              echo "$LOG" | grep -iE '^docs' || true
+              echo ""
+              echo '### Other'
+              echo "$LOG" | grep -ivE '^(feat|fix|refactor|perf|style|docs)' || true
+            } >> NOTES.md
+          else
+            echo "" >> NOTES.md
+            echo "No notable changes recorded." >> NOTES.md
+          fi
+
+      # Upload the exe to the Release for this tag, with the notes above.
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.exe
-          generate_release_notes: true
+          body_path: NOTES.md

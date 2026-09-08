@@ -27,6 +27,12 @@ and exchanges two newline-delimited JSON-RPC messages: `initialize`, then `accou
 
 The app never sends an `Authorization`/`Bearer`/`Cookie` header and never reads account credentials — the Codex CLI handles authentication itself, out of process.
 
+## Releasing
+
+Pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) triggers a CI build that publishes the exe with auto-generated release notes.
+
+Write commits in [Conventional Commits](https://www.conventionalcommits.org) style so the notes are grouped: `feat:` → "Added", `fix:` → "Fixed", `refactor:`/`perf:`/`style:` → "Changed", `docs:` → "Docs".
+
 ## Build
 
 You'll need the **Rust toolchain (MSVC)** — `rustc`/`cargo` with the MSVC target.
