@@ -145,27 +145,32 @@ impl Server {
         }
     }
 
-    /// Fetch a quota snapshot on this (possibly reused) connection. The
-    /// `initialize` handshake runs once; later calls skip it so the long-lived
-    /// connection is reused instead of respawning `codex` each refresh. On
-    /// success the child stays alive; on error the caller drops it and respawns.
-    fn fetch_quota(&mut self) -> Result<Quota, FetchError> {
-        if !self.initialized {
-            let init_id = self.next_id;
-            self.next_id += 1;
-            self.write(&json!({
-                "method": "initialize",
-                "id": init_id,
-                "params": {
-                    "protocolVersion": 1,
-                    "capabilities": {},
-                    "clientInfo": { "name": "codex-gauge", "version": "0.1.0" }
-                }
-            }))?;
-            self.read_for(init_id, Duration::from_secs(10))?;
-            self.initialized = true;
+    /// Run the `initialize` handshake once on this connection. Callers invoke
+    /// this before reading quota; once it succeeds the connection is usable.
+    fn ensure_connected(&mut self) -> Result<(), FetchError> {
+        if self.initialized {
+            return Ok(());
         }
+        let init_id = self.next_id;
+        self.next_id += 1;
+        self.write(&json!({
+            "method": "initialize",
+            "id": init_id,
+            "params": {
+                "protocolVersion": 1,
+                "capabilities": {},
+                "clientInfo": { "name": "codex-gauge", "version": "0.1.0" }
+            }
+        }))?;
+        // Keep the handshake tight: a hanging codex would otherwise leave the
+        // widget staring at "Connecting..." for the full timeout.
+        self.read_for(init_id, RPC_TIMEOUT)?;
+        self.initialized = true;
+        Ok(())
+    }
 
+    /// Read a quota snapshot on an already-connected (handshook) connection.
+    fn read_quota(&mut self) -> Result<Quota, FetchError> {
         // account/rateLimits/read
         let read_id = self.next_id;
         self.next_id += 1;
@@ -174,11 +179,15 @@ impl Server {
             "id": read_id,
             "params": {}
         }))?;
-        let result = self.read_for(read_id, Duration::from_secs(10))?;
+        let result = self.read_for(read_id, RPC_TIMEOUT)?;
 
         Ok(map_result(&result))
     }
 }
+
+/// Aggressive RPC timeout: a slow or absent codex shouldn't leave the widget
+/// stuck on "Connecting..." — fail fast and let the fast retry catch it later.
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Long-lived `codex app-server` connection shared across refreshes, so we
 /// don't restart the CLI every 5 minutes. `main.rs` guarantees at most one
@@ -218,23 +227,49 @@ pub fn map_result(result: &Value) -> Quota {
 
 /// Fetch quota, reusing the long-lived connection when possible; on failure it
 /// is dropped (killing the child) and a fresh one is spawned.
+///
+/// The result distinguishes two failure levels:
+/// - `Err`: the process couldn't start or the `initialize` handshake failed —
+///   the widget stays on "Connecting..." and the caller schedules a fast retry.
+/// - `Ok(quota)` with `quota.connected == false` (unused for now) vs `true`.
+/// - `Ok(quota)` with `connected == true` but placeholder rows: the handshake
+///   succeeded, so "Connecting..." is done, but the data read failed/hung. We
+///   keep the connection and return a connected placeholder rather than
+///   dropping it, so the widget flips out of Connecting as soon as reachable.
 pub fn fetch_quota_async() -> Result<Quota, FetchError> {
     let mut guard = SERVER.lock().unwrap();
 
     // Reuse the existing connection if it's still healthy.
     if let Some(server) = guard.as_mut() {
-        match server.fetch_quota() {
-            Ok(q) => return Ok(q),
+        // Handshake: if this fails the connection is dead, drop and respawn.
+        if let Err(_) = server.ensure_connected() {
             // Connection died/hung: drop it (Drop kills the child) and respawn.
-            Err(_) => {
-                let _ = guard.take();
-            }
+            let _ = guard.take();
+        } else {
+            // Connected. Best-effort read: on success return real data; on
+            // failure return a connected placeholder so we don't regress to
+            // "Connecting..." — data updates on the next refresh.
+            return Ok(server.read_quota().unwrap_or_else(|_| connected_placeholder()));
         }
     }
 
     // First connection, or the old one died: spawn fresh and leave it cached.
     let mut server = Server::start()?;
-    let quota = server.fetch_quota()?;
+    // Handshake now; only a handshake failure is a hard error (still Connecting).
+    server.ensure_connected()?;
     *guard = Some(server);
-    Ok(quota)
+    // Connected. Best-effort read (see comment above). We read through the
+    // guard so `server` isn't double-moved.
+    match guard.as_mut() {
+        Some(conn) => Ok(conn.read_quota().unwrap_or_else(|_| connected_placeholder())),
+        None => Ok(connected_placeholder()),
+    }
+}
+
+/// A `connected` snapshot with no data yet, so the UI can leave "Connecting..."
+/// as soon as the handshake succeeds while rates are still unknown/failed.
+fn connected_placeholder() -> Quota {
+    let mut q = Quota::disconnected();
+    q.connected = true;
+    q
 }

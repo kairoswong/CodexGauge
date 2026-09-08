@@ -78,7 +78,7 @@ jobs:
             fi
           }
 
-          echo "## What's Changed" > NOTES.md
+          echo "## What's Changed?" > NOTES.md
           if [ -n "$LOG" ]; then
             emit '### Added'   "$(echo "$LOG" | grep -iE '^feat' || true)"
             emit '### Fixed'   "$(echo "$LOG" | grep -iE '^fix' || true)"

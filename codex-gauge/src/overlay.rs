@@ -38,16 +38,6 @@ pub fn register_window_class(hinstance: HINSTANCE) -> Result<()> {
 /// Latest quota the overlay draws (mutated from the message-loop thread).
 static QUOTA: std::sync::OnceLock<Arc<std::sync::Mutex<Quota>>> = std::sync::OnceLock::new();
 
-/// Embedded app icon (resource ID 1), loaded once so the offline state can draw
-/// it. The proc has no hinstance, so cache it here.
-///
-/// `HICON` is a raw pointer, not `Send + Sync`, but it is created once by the
-/// UI thread, drawn read-only, and never freed — so sharing it is sound.
-struct AppIcon(HICON);
-unsafe impl Send for AppIcon {}
-unsafe impl Sync for AppIcon {}
-static APP_ICON: std::sync::OnceLock<AppIcon> = std::sync::OnceLock::new();
-
 /// GDI fonts, created once and cached so `WM_PAINT` (which fires often while
 /// dragging) doesn't create and destroy an `HFONT` every time. Like the icon,
 /// they are read-only and live for the whole process.
@@ -59,8 +49,6 @@ unsafe impl Sync for AppFont {}
 static FONT_SMALL: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
 /// Big (-13, semibold) for the primary "used %" figures.
 static FONT_BIG: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
-/// Offline-state (-16, semibold) for the "Connecting..." line.
-static FONT_OFFLINE: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
 
 /// Cached font for (height, weight), created on first use and never freed.
 fn cached_font(slot: &'static std::sync::OnceLock<AppFont>, height: i32, weight: i32) -> HFONT {
@@ -116,11 +104,6 @@ pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
             let _ = SetWindowRgn(hwnd, rgn, TRUE);
         }
     }
-
-    // Cache the embedded icon here; the window proc has no hinstance.
-    let _ = APP_ICON.get_or_init(|| {
-        AppIcon(unsafe { LoadIconW(hinstance, PCWSTR(1 as *const u16)) }.unwrap_or_default())
-    });
 
     Ok(Overlay { hwnd })
 }
@@ -194,96 +177,81 @@ fn paint(hwnd: HWND) {
     let left = 14i32;
     let right = w - 14;
 
-    if quota.connected {
-        // Two stacked rows: [5h] [========================] [12%]
-        //                   [1w] [========================] [45%]
-        let row_top = 12i32;
-        let row_gap = 34i32;
-        let wins: Vec<&crate::quota::Window> = quota
+    // Keep the quota layout visible while the first app-server request is in
+    // flight. Placeholder rows make the initial state look like an empty
+    // gauge instead of a separate connection screen.
+    let rows: Vec<(String, f64)> = if quota.connected {
+        quota
             .primary
             .iter()
             .chain(quota.secondary.iter())
-            .collect();
-
-        for (i, win) in wins.iter().enumerate() {
-            let used = win.used_percent.clamp(0.0, 100.0);
-            let label = win.label();
-            let used_txt = format!("{}%", used.round() as i32);
-            let y = row_top + i as i32 * row_gap;
-
-            // Label (small, muted) anchored left.
-            unsafe { SetTextColor(hdc, rgb(150, 152, 162)) };
-            draw_text(hdc, left, y, &label);
-
-            // Primary figure (big, bright, follows status color) anchored right.
-            let (r, g, b) = color_for(used);
-            unsafe { SelectObject(hdc, big_font) };
-            unsafe { SetTextColor(hdc, rgb(r, g, b)) };
-            let w_used = text_width(hdc, &used_txt);
-            unsafe { let _ = TextOutW(hdc, right - w_used, y - 2, &to_wide(&used_txt)); };
-            unsafe { SelectObject(hdc, small_font) };
-
-            // Progress bar (below the text row): full-width track.
-            let bar_y = y + 20;
-            let bar_h = 6i32;
-            let track = rgb(57, 59, 70);
-            unsafe {
-                SetDCBrushColor(hdc, track);
-                let _ = Rectangle(hdc, left, bar_y, right, bar_y + bar_h);
-            }
-            let fill_w = ((right - left) as f64 * (used / 100.0)).round() as i32;
-            if fill_w > 0 {
-                unsafe {
-                    SetDCBrushColor(hdc, rgb(r, g, b));
-                    let _ = Rectangle(hdc, left, bar_y, left + fill_w, bar_y + bar_h);
-                }
-            }
-        }
-
-        // Thin divider separating the figures from the reset line.
-        let div_y = 92i32;
-        unsafe { SetDCBrushColor(hdc, rgb(43, 45, 54)) };
-        unsafe { let _ = Rectangle(hdc, left, div_y, right, div_y + 1); };
-
-        // Reset line (small, faint) anchored left under the divider.
-        unsafe { SetTextColor(hdc, rgb(136, 139, 150)) };
-        let second = match quota.next_reset() {
-            Some(win) => format_reset(win.resets_at),
-            None => "Connected".to_string(),
-        };
-        draw_text(hdc, left, 98, &second);
-
-        // Brand mark in the bottom-right corner: "Codex".
-        let brand = "Codex";
-        let bw = text_width(hdc, brand);
-        unsafe { SetTextColor(hdc, rgb(120, 124, 138)) };
-        draw_text(hdc, right - bw, 98, brand);
+            .map(|win| (win.label(), win.used_percent))
+            .collect()
     } else {
-        // Not connected: show the app icon and a larger terse centered line so
-        // the widget reads clearly while it is still connecting.
-        let icon = APP_ICON.get().map(|a| a.0).unwrap_or(HICON::default());
-        if !icon.is_invalid() {
-            let icon_size = 32i32;
-            let ix = (w - icon_size) / 2;
-            let iy = 32;
+        vec![("5h".to_string(), 0.0), ("1w".to_string(), 0.0)]
+    };
+
+    // Two stacked rows: [5h] [========================] [12%]
+    //                   [1w] [========================] [45%]
+    let row_top = 12i32;
+    let row_gap = 34i32;
+
+    for (i, (label, raw_used)) in rows.iter().enumerate() {
+        let used = raw_used.clamp(0.0, 100.0);
+        let used_txt = format!("{}%", used.round() as i32);
+        let y = row_top + i as i32 * row_gap;
+
+        // Label (small, muted) anchored left.
+        unsafe { SetTextColor(hdc, rgb(150, 152, 162)) };
+        draw_text(hdc, left, y, &label);
+
+        // Primary figure (big, bright, follows status color) anchored right.
+        let (r, g, b) = color_for(used);
+        unsafe { SelectObject(hdc, big_font) };
+        unsafe { SetTextColor(hdc, rgb(r, g, b)) };
+        let w_used = text_width(hdc, &used_txt);
+        unsafe { let _ = TextOutW(hdc, right - w_used, y - 2, &to_wide(&used_txt)); };
+        unsafe { SelectObject(hdc, small_font) };
+
+        // Progress bar (below the text row): full-width track.
+        let bar_y = y + 20;
+        let bar_h = 6i32;
+        let track = rgb(57, 59, 70);
+        unsafe {
+            SetDCBrushColor(hdc, track);
+            let _ = Rectangle(hdc, left, bar_y, right, bar_y + bar_h);
+        }
+        let fill_w = ((right - left) as f64 * (used / 100.0)).round() as i32;
+        if fill_w > 0 {
             unsafe {
-                let _ = DrawIconEx(
-                    hdc,
-                    ix,
-                    iy,
-                    icon,
-                    icon_size,
-                    icon_size,
-                    0,
-                    HBRUSH::default(),
-                    DI_NORMAL,
-                );
+                SetDCBrushColor(hdc, rgb(r, g, b));
+                let _ = Rectangle(hdc, left, bar_y, left + fill_w, bar_y + bar_h);
             }
         }
-        let offline_font = cached_font(&FONT_OFFLINE, -16, 550);
-        unsafe { SetTextColor(hdc, rgb(170, 172, 182)) };
-        draw_centered(hdc, w, 68, "Connecting...", offline_font);
     }
+
+    // Thin divider separating the figures from the reset line.
+    let div_y = 92i32;
+    unsafe { SetDCBrushColor(hdc, rgb(43, 45, 54)) };
+    unsafe { let _ = Rectangle(hdc, left, div_y, right, div_y + 1); };
+
+    // Reset line (small, faint) anchored left under the divider.
+    unsafe { SetTextColor(hdc, rgb(136, 139, 150)) };
+    let second = if quota.connected {
+        quota
+            .next_reset()
+            .map(|win| format_reset(win.resets_at))
+            .unwrap_or_else(|| "Connected".to_string())
+    } else {
+        "Connecting...".to_string()
+    };
+    draw_text(hdc, left, 98, &second);
+
+    // Brand mark in the bottom-right corner: "Codex".
+    let brand = "Codex";
+    let bw = text_width(hdc, brand);
+    unsafe { SetTextColor(hdc, rgb(120, 124, 138)) };
+    draw_text(hdc, right - bw, 98, brand);
 
     unsafe { SelectObject(hdc, small_old) };
 
@@ -318,18 +286,6 @@ fn text_width(hdc: HDC, s: &str) -> i32 {
         let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
         sz.cx
     }
-}
-
-/// Draw text horizontally centered across the window width.
-fn draw_centered(hdc: HDC, w: i32, y: i32, s: &str, font: HFONT) {
-    unsafe { SelectObject(hdc, font) };
-    let wide = to_wide(s);
-    let width = unsafe {
-        let mut sz = SIZE::default();
-        let _ = GetTextExtentPoint32W(hdc, &wide, &mut sz);
-        sz.cx
-    };
-    unsafe { let _ = TextOutW(hdc, (w - width) / 2, y, &wide); };
 }
 
 /// Build a GDI COLORREF from r/g/b (0-255).
