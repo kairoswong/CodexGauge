@@ -1,0 +1,21 @@
+# --- Rust ---
+target/
+**/target/
+*.rs.bk
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Misc build artifacts ---
+*.log
+*.binlog
+artifacts/

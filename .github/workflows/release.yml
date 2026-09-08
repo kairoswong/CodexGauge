@@ -1,0 +1,64 @@
+# Build and upload the exe to a GitHub Release when a version tag (e.g. v0.1.0) is pushed.
+# Usage: git tag v0.1.0 && git push origin v0.1.0
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and upload release asset
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Strip the leading 'v' from the tag, e.g. v0.1.0 -> 0.1.0
+      - name: Get tag name
+        id: meta
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Cache cargo dependencies to speed up later builds
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-gauge/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release)
+        working-directory: codex-gauge
+        run: cargo build --release
+
+      # Rename to a versioned filename
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp codex-gauge/target/release/codex-gauge.exe \
+             "dist/codex-gauge-${{ steps.meta.outputs.VERSION }}-x86_64-pc-windows-msvc.exe"
+
+      # Upload the exe to the Release for this tag
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
