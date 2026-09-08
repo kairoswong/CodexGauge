@@ -61,16 +61,17 @@ pub fn set_quota(q: Quota) {
     }
 }
 
-/// Create the overlay window at the top-right of the primary screen.
+/// Create the overlay window at the bottom-right of the primary screen.
 pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
     let _ = QUOTA.set(Arc::new(std::sync::Mutex::new(Quota::disconnected())));
 
     // Determine primary screen working area to place the widget.
-    let sm = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let w = 236i32;
     let h = 122i32;
-    let x = sm - w - 24;
-    let y = 24;
+    let x = screen_w - w - 50;
+    let y = screen_h - h - 50;
 
     let ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
     let style = WS_POPUP;
@@ -180,16 +181,16 @@ fn paint(hwnd: HWND) {
     // Keep the quota layout visible while the first app-server request is in
     // flight. Placeholder rows make the initial state look like an empty
     // gauge instead of a separate connection screen.
-    let rows: Vec<(String, f64)> = if quota.connected {
-        quota
-            .primary
-            .iter()
-            .chain(quota.secondary.iter())
-            .map(|win| (win.label(), win.used_percent))
-            .collect()
-    } else {
-        vec![("5h".to_string(), 0.0), ("1w".to_string(), 0.0)]
-    };
+    let rows: Vec<(String, f64)> = vec![
+        (
+            quota.primary.as_ref().map(|win| win.label()).unwrap_or_else(|| "5h".to_string()),
+            quota.primary.as_ref().map(|win| win.used_percent).unwrap_or(0.0),
+        ),
+        (
+            quota.secondary.as_ref().map(|win| win.label()).unwrap_or_else(|| "1w".to_string()),
+            quota.secondary.as_ref().map(|win| win.used_percent).unwrap_or(0.0),
+        ),
+    ];
 
     // Two stacked rows: [5h] [========================] [12%]
     //                   [1w] [========================] [45%]
@@ -241,7 +242,7 @@ fn paint(hwnd: HWND) {
         quota
             .next_reset()
             .map(|win| format_reset(win.resets_at))
-            .unwrap_or_else(|| "Connected".to_string())
+            .unwrap_or_else(|| "Reset unavailable".to_string())
     } else {
         "Connecting...".to_string()
     };

@@ -12,6 +12,7 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,8 @@ use std::sync::OnceLock;
 use crate::quota::Quota;
 
 const REFRESH_MS: u32 = 300_000; // 5 min
-const RETRY_MS: u32 = 8_000; // fast retry after a failed refresh
+const STARTUP_DELAY_MS: u32 = 100;
+const RETRY_MS: u32 = 2_000; // fast retry after a failed refresh
 const TIMER_REFRESH: usize = 1;
 const TIMER_STARTUP: usize = 2;
 const TIMER_WAKE_REFRESH: usize = 3;
@@ -39,6 +41,11 @@ static OVERLAY_HWND: OnceLock<usize> = OnceLock::new();
 static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
+    let _instance_mutex = unsafe { CreateMutexW(None, false, w!("Local\\CodexGauge"))? };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return Ok(());
+    }
+
     let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }?.into();
 
     overlay::register_window_class(hinstance)?;
@@ -63,7 +70,7 @@ fn main() -> Result<()> {
     unsafe { let _ = ShowWindow(overlay.hwnd, SW_SHOWNOACTIVATE); };
     unsafe { let _ = UpdateWindow(overlay.hwnd); };
 
-    unsafe { SetTimer(bus, TIMER_STARTUP, 500, None) }; // refresh shortly after startup
+    unsafe { SetTimer(bus, TIMER_STARTUP, STARTUP_DELAY_MS, None) }; // refresh shortly after startup
     unsafe { SetTimer(bus, TIMER_REFRESH, REFRESH_MS, None) }; // periodic
 
     // Consecutive failed refreshes; reset on success to bound fast retries.

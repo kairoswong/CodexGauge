@@ -2,11 +2,15 @@
 //! auth; this binary never touches credentials.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Pipes::PeekNamedPipe;
 
 use crate::quota::{Quota, Window};
 
@@ -117,6 +121,18 @@ impl Server {
             if std::time::Instant::now() >= deadline {
                 return Err(FetchError::Rpc("timeout waiting for codex".to_string()));
             }
+
+            let mut available = 0u32;
+            let handle = HANDLE(self.stdout.get_ref().as_raw_handle() as *mut std::ffi::c_void);
+            unsafe {
+                PeekNamedPipe(handle, None, 0, None, Some(&mut available), None)
+                    .map_err(|e| FetchError::Io(e.to_string()))?;
+            }
+            if available == 0 {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
             let mut line = String::new();
             match self
                 .stdout
@@ -181,7 +197,12 @@ impl Server {
         }))?;
         let result = self.read_for(read_id, RPC_TIMEOUT)?;
 
-        Ok(map_result(&result))
+        let quota = map_result(&result);
+        if quota.connected {
+            Ok(quota)
+        } else {
+            Err(FetchError::Rpc("quota data unavailable".to_string()))
+        }
     }
 }
 
@@ -225,17 +246,9 @@ pub fn map_result(result: &Value) -> Quota {
     q
 }
 
-/// Fetch quota, reusing the long-lived connection when possible; on failure it
-/// is dropped (killing the child) and a fresh one is spawned.
-///
-/// The result distinguishes two failure levels:
-/// - `Err`: the process couldn't start or the `initialize` handshake failed —
-///   the widget stays on "Connecting..." and the caller schedules a fast retry.
-/// - `Ok(quota)` with `quota.connected == false` (unused for now) vs `true`.
-/// - `Ok(quota)` with `connected == true` but placeholder rows: the handshake
-///   succeeded, so "Connecting..." is done, but the data read failed/hung. We
-///   keep the connection and return a connected placeholder rather than
-///   dropping it, so the widget flips out of Connecting as soon as reachable.
+/// Fetch quota, reusing the long-lived connection when possible. A fetch only
+/// succeeds once real rate-limit data is available, so the UI goes directly
+/// from its connecting state to actual usage values.
 pub fn fetch_quota_async() -> Result<Quota, FetchError> {
     let mut guard = SERVER.lock().unwrap();
 
@@ -246,10 +259,7 @@ pub fn fetch_quota_async() -> Result<Quota, FetchError> {
             // Connection died/hung: drop it (Drop kills the child) and respawn.
             let _ = guard.take();
         } else {
-            // Connected. Best-effort read: on success return real data; on
-            // failure return a connected placeholder so we don't regress to
-            // "Connecting..." — data updates on the next refresh.
-            return Ok(server.read_quota().unwrap_or_else(|_| connected_placeholder()));
+            return server.read_quota();
         }
     }
 
@@ -258,18 +268,9 @@ pub fn fetch_quota_async() -> Result<Quota, FetchError> {
     // Handshake now; only a handshake failure is a hard error (still Connecting).
     server.ensure_connected()?;
     *guard = Some(server);
-    // Connected. Best-effort read (see comment above). We read through the
-    // guard so `server` isn't double-moved.
+    // Read through the guard so the live connection remains cached.
     match guard.as_mut() {
-        Some(conn) => Ok(conn.read_quota().unwrap_or_else(|_| connected_placeholder())),
-        None => Ok(connected_placeholder()),
+        Some(conn) => conn.read_quota(),
+        None => Err(FetchError::Io("codex connection was lost".to_string())),
     }
-}
-
-/// A `connected` snapshot with no data yet, so the UI can leave "Connecting..."
-/// as soon as the handshake succeeds while rates are still unknown/failed.
-fn connected_placeholder() -> Quota {
-    let mut q = Quota::disconnected();
-    q.connected = true;
-    q
 }
