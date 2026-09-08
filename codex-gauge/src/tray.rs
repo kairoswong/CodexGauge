@@ -19,8 +19,8 @@ pub fn add(hwnd: HWND, hinstance: HINSTANCE) -> Result<()> {
         ..Default::default()
     };
 
-    // Load the embedded app icon (resource ID 1 from build.rs); fall back to
-    // the generic system application icon if it cannot be loaded.
+    // Load the embedded app icon (resource ID 1); fall back to the generic
+    // application icon if missing.
     let icon = unsafe { LoadIconW(hinstance, PCWSTR(1 as *const u16)) }.unwrap_or_default();
     nd.hIcon = if !icon.is_invalid() {
         icon
@@ -57,9 +57,8 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
-/// Build and show the right-click context menu. `hwnd` should be a *visible*
-/// window (the overlay) so the popup reliably takes the foreground. Selected
-/// commands are delivered back to the main loop via WM_COMMAND.
+/// Build and show the right-click context menu. `hwnd` should be visible (the
+/// overlay) so the popup reliably takes the foreground.
 pub fn show_menu(hwnd: HWND) {
     let hmenu = match unsafe { CreatePopupMenu() } {
         Ok(m) => m,
@@ -73,9 +72,8 @@ pub fn show_menu(hwnd: HWND) {
     unsafe { let _ = GetCursorPos(&mut pt); };
     unsafe {
         let _ = SetForegroundWindow(hwnd);
-        // No TPM_RETURNCMD: the menu item click is delivered to the owner
-        // window (overlay) as a WM_COMMAND message, which overlay_wndproc
-        // forwards to the main message loop.
+        // No TPM_RETURNCMD: the click is delivered to the owner (overlay) as a
+        // WM_COMMAND, which overlay_wndproc forwards to the main message loop.
         let _ = TrackPopupMenu(
             hmenu,
             TPM_LEFTALIGN | TPM_RIGHTBUTTON,

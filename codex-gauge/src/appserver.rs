@@ -1,6 +1,5 @@
-//! Talks to the real Codex CLI by spawning `codex app-server --stdio`
-//! and driving a JSON-RPC exchange. The child process handles all auth;
-//! this binary never touches credentials.
+//! Drives `codex app-server --stdio` over JSON-RPC. The child handles all
+//! auth; this binary never touches credentials.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
@@ -34,11 +33,11 @@ struct Server {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
+    /// Whether the `initialize` handshake has completed on this connection.
+    initialized: bool,
 }
 
-/// Always kill the spawned codex subprocess, even on early-return error paths
-/// (timeouts, I/O errors). Prevents orphaned `codex app-server` processes from
-/// piling up when the network is down/slow and fetches keep failing.
+/// Kill the child on drop so a failed/timeout fetch never orphans the process.
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -47,16 +46,9 @@ impl Drop for Server {
 }
 
 impl Server {
-    /// Kill the child process once we're done, best-effort.
-    fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-
     fn start() -> Result<Self, FetchError> {
-        // On Windows, npm installs codex as `codex.cmd`, but CreateProcess only
-        // auto-appends `.exe`, so `Command::new("codex")` can't resolve it.
-        // Try the common spellings in order and keep the first that spawns.
+        // On Windows, codex is often `codex.cmd` (CreateProcess only appends
+        // `.exe`), so try the common spellings in order.
         #[cfg(windows)]
         const CANDIDATES: [&str; 3] = ["codex.cmd", "codex.exe", "codex"];
         #[cfg(not(windows))]
@@ -65,8 +57,8 @@ impl Server {
         let mut last_err: Option<std::io::Error> = None;
         let mut spawned = None;
         for name in CANDIDATES {
-            // CREATE_NO_WINDOW: spawning codex.cmd goes through cmd.exe, which
-            // would otherwise flash a console window on this GUI-subsystem app.
+            // CREATE_NO_WINDOW stops cmd.exe from flashing a console on this
+            // GUI-subsystem app.
             match Command::new(name)
                 .arg("app-server")
                 .arg("--stdio")
@@ -105,6 +97,7 @@ impl Server {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            initialized: false,
         })
     }
 
@@ -117,7 +110,7 @@ impl Server {
             .map_err(|e| FetchError::Io(e.to_string()))
     }
 
-    /// Read lines until we find a message whose `id` matches, returning its `result`.
+    /// Read lines until a message whose `id` matches, returning its `result`.
     fn read_for(&mut self, want_id: i64, timeout: Duration) -> Result<Value, FetchError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -152,21 +145,26 @@ impl Server {
         }
     }
 
-    /// Full handshake + quota read.
-    fn fetch_quota(mut self) -> Result<Quota, FetchError> {
-        // initialize
-        let init_id = self.next_id;
-        self.next_id += 1;
-        self.write(&json!({
-            "method": "initialize",
-            "id": init_id,
-            "params": {
-                "protocolVersion": 1,
-                "capabilities": {},
-                "clientInfo": { "name": "codex-gauge", "version": "0.1.0" }
-            }
-        }))?;
-        self.read_for(init_id, Duration::from_secs(10))?;
+    /// Fetch a quota snapshot on this (possibly reused) connection. The
+    /// `initialize` handshake runs once; later calls skip it so the long-lived
+    /// connection is reused instead of respawning `codex` each refresh. On
+    /// success the child stays alive; on error the caller drops it and respawns.
+    fn fetch_quota(&mut self) -> Result<Quota, FetchError> {
+        if !self.initialized {
+            let init_id = self.next_id;
+            self.next_id += 1;
+            self.write(&json!({
+                "method": "initialize",
+                "id": init_id,
+                "params": {
+                    "protocolVersion": 1,
+                    "capabilities": {},
+                    "clientInfo": { "name": "codex-gauge", "version": "0.1.0" }
+                }
+            }))?;
+            self.read_for(init_id, Duration::from_secs(10))?;
+            self.initialized = true;
+        }
 
         // account/rateLimits/read
         let read_id = self.next_id;
@@ -178,10 +176,14 @@ impl Server {
         }))?;
         let result = self.read_for(read_id, Duration::from_secs(10))?;
 
-        self.shutdown();
         Ok(map_result(&result))
     }
 }
+
+/// Long-lived `codex app-server` connection shared across refreshes, so we
+/// don't restart the CLI every 5 minutes. `main.rs` guarantees at most one
+/// fetch in flight, so this is never contended (`Server` is `Send`).
+static SERVER: std::sync::Mutex<Option<Server>> = std::sync::Mutex::new(None);
 
 /// Map one bucket JSON object into a `Window`.
 fn map_window(node: &Value) -> Option<Window> {
@@ -214,9 +216,25 @@ pub fn map_result(result: &Value) -> Quota {
     q
 }
 
-/// Spawn codex and return the fetched quota. Returns a disconnected quota
-/// (or propagates the error) so the UI can show status.
+/// Fetch quota, reusing the long-lived connection when possible; on failure it
+/// is dropped (killing the child) and a fresh one is spawned.
 pub fn fetch_quota_async() -> Result<Quota, FetchError> {
-    let server = Server::start()?;
-    server.fetch_quota()
+    let mut guard = SERVER.lock().unwrap();
+
+    // Reuse the existing connection if it's still healthy.
+    if let Some(server) = guard.as_mut() {
+        match server.fetch_quota() {
+            Ok(q) => return Ok(q),
+            // Connection died/hung: drop it (Drop kills the child) and respawn.
+            Err(_) => {
+                let _ = guard.take();
+            }
+        }
+    }
+
+    // First connection, or the old one died: spawn fresh and leave it cached.
+    let mut server = Server::start()?;
+    let quota = server.fetch_quota()?;
+    *guard = Some(server);
+    Ok(quota)
 }

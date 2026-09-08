@@ -57,12 +57,11 @@ jobs:
              "dist/codex-gauge-${{ steps.meta.outputs.VERSION }}-x86_64-pc-windows-msvc.exe"
 
       # Build structured release notes from Conventional Commits since the last
-      # tag (e.g. "feat: ..." -> ### Added). Falls back to a plain commit list.
+      # tag (e.g. "feat: ..." -> ### Added). Empty categories are omitted.
       - name: Generate release notes
         id: notes
         shell: bash
         run: |
-          echo "## What's Changed" > NOTES.md
           # Most recent tag visible from the previous commit (empty for the
           # very first release), plus the current tag.
           LAST_TAG=$(git describe --abbrev=0 --tags HEAD~1 2>/dev/null || true)
@@ -71,24 +70,21 @@ jobs:
           else
             LOG=$(git log --pretty=format:'%s' --no-merges 2>/dev/null || true)
           fi
+
+          emit() { # $1 = heading, $2 = matching lines (non-empty to emit)
+            local heading="$1" lines="$2"
+            if [ -n "$lines" ]; then
+              { echo ""; echo "$heading"; echo "$lines"; } >> NOTES.md
+            fi
+          }
+
+          echo "## What's Changed" > NOTES.md
           if [ -n "$LOG" ]; then
-            {
-              echo ""
-              echo '### Added'
-              echo "$LOG" | grep -iE '^feat' || true
-              echo ""
-              echo '### Fixed'
-              echo "$LOG" | grep -iE '^fix' || true
-              echo ""
-              echo '### Changed'
-              echo "$LOG" | grep -iE '^(refactor|perf|style)' || true
-              echo ""
-              echo '### Docs'
-              echo "$LOG" | grep -iE '^docs' || true
-              echo ""
-              echo '### Other'
-              echo "$LOG" | grep -ivE '^(feat|fix|refactor|perf|style|docs)' || true
-            } >> NOTES.md
+            emit '### Added'   "$(echo "$LOG" | grep -iE '^feat' || true)"
+            emit '### Fixed'   "$(echo "$LOG" | grep -iE '^fix' || true)"
+            emit '### Changed' "$(echo "$LOG" | grep -iE '^(refactor|perf|style)' || true)"
+            emit '### Docs'    "$(echo "$LOG" | grep -iE '^docs' || true)"
+            emit '### Other'   "$(echo "$LOG" | grep -ivE '^(feat|fix|refactor|perf|style|docs)' || true)"
           else
             echo "" >> NOTES.md
             echo "No notable changes recorded." >> NOTES.md

@@ -1,6 +1,6 @@
 # CodexGauge
 
-A floating Codex quota widget for Windows 10/11 x64. It's a pure native **Win32 (Rust)** build — a single tiny `codex-gauge.exe` (~**266 KB**) with **no runtime or dependencies**. It runs on any 64-bit Windows out of the box.
+A floating Codex quota widget for Windows 10/11 x64. It's a pure native **Win32 (Rust)** build — a single tiny `codex-gauge.exe` with **no runtime or dependencies**. It runs on any 64-bit Windows out of the box.
 
 The window stays above other windows and stays out of the taskbar. Click the tray gauge to show or hide it; right-click for **Refresh** and **Exit**.
 
@@ -14,13 +14,13 @@ CodexGauge is that reminder: a tiny, always-on-top widget that quietly shows you
 
 CodexGauge reads **real** Codex quota through the official **app-server JSON-RPC interface** — no separate HTTP service, no API key, no token, and no scraping of private files.
 
-On each refresh it spawns the Codex CLI as a child process:
+On first use it spawns the Codex CLI as a child process and keeps it alive as a long-lived connection, reusing it across refreshes instead of restarting the CLI every time:
 
 ```powershell
 codex app-server --stdio
 ```
 
-and exchanges two newline-delimited JSON-RPC messages: `initialize`, then `account/rateLimits/read`. It maps the returned percentage window (the `codex` metered bucket) onto the widget model:
+It exchanges newline-delimited JSON-RPC messages: `initialize` (once per connection), then `account/rateLimits/read` on each refresh. If the held connection ever dies, times out, or hangs, the child is torn down and a fresh one is respawned on the next tick. It maps the returned percentage window (the `codex` metered bucket) onto the widget model:
 
 - `used_percent` ← `rateLimits.primary.usedPercent`
 - `resets_at` ← `rateLimits.primary.resetsAt` (Unix epoch seconds)
@@ -42,7 +42,7 @@ cd codex-gauge
 cargo build --release
 ```
 
-The binary lands at `codex-gauge\target\release\codex-gauge.exe` (~**266 KB**), and has **no .NET or other runtime dependency**.
+The binary lands at `codex-gauge\target\release\codex-gauge.exe`, and has **no .NET or other runtime dependency**.
 
 ## Features
 
@@ -59,13 +59,13 @@ The binary lands at `codex-gauge\target\release\codex-gauge.exe` (~**266 KB**), 
   - **Left-click** toggles the overlay show/hide.
   - **Right-click** opens a menu with **Refresh** and **Exit**.
   - Tooltip reads `Codex Usage`.
-- Auto-refresh every 5 minutes, plus a refresh shortly after startup. A global in-flight guard skips a tick if a previous fetch is still running, so a slow or dropped network can't pile up overlapping codex subprocesses, and failed fetches always dispose the child.
+- Auto-refresh every 5 minutes, plus a refresh shortly after startup. A global in-flight guard skips a tick if a previous fetch is still running, so a slow or dropped network can't pile up overlapping codex subprocesses. When the machine wakes from sleep it also triggers a delayed refresh so the shown quota isn't stale.
 - Reads live quota via `codex app-server --stdio` (JSON-RPC); the Codex CLI handles authentication out of process, so the app never touches credentials.
 
 ## Behavior
 
-- A startup refresh, a single 5-minute timer, and manual refresh drive data updates. An in-flight guard skips a periodic tick when a previous fetch is still running, keeping at most one codex subprocess alive at a time.
-- The default data source spawns `codex app-server --stdio` per request and always disposes of the child afterwards — even on timeout or I/O failure (via `Drop`) — so no orphan processes accumulate.
+- A startup refresh, a single 5-minute timer, a wake-from-sleep refresh, and manual refresh drive data updates. An in-flight guard skips a periodic tick when a previous fetch is still running, keeping at most one quota fetch in play at a time.
+- The default data source holds one long-lived `codex app-server --stdio` connection and reuses it across refreshes (the `initialize` handshake runs once per connection). If that connection ever dies or hangs, the child is disposed (via `Drop`) and a fresh one is spawned on the next tick — so no orphan processes accumulate and the CLI isn't restarted on every refresh.
 - On a failed fetch the widget shows a terse `Connecting...` state and retries on the next timer tick.
 - Tray **Exit** quits the process and removes the tray icon; closing via the tray is the way to quit (the overlay has no close button).
 

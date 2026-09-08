@@ -35,21 +35,37 @@ pub fn register_window_class(hinstance: HINSTANCE) -> Result<()> {
     Ok(())
 }
 
-/// The latest quota the overlay should draw. Mutated from the message loop thread.
+/// Latest quota the overlay draws (mutated from the message-loop thread).
 static QUOTA: std::sync::OnceLock<Arc<std::sync::Mutex<Quota>>> = std::sync::OnceLock::new();
 
-/// The embedded app icon (resource ID 1), loaded once and drawn in the offline
-/// state so the widget is recognisable while it is still connecting.
+/// Embedded app icon (resource ID 1), loaded once so the offline state can draw
+/// it. The proc has no hinstance, so cache it here.
 ///
-/// `HICON` is a raw pointer and not `Send + Sync`, but this icon is created by
-/// the UI thread, drawn read-only via GDI, and never mutated or freed, so
-/// sharing it behind a `static` is sound.
+/// `HICON` is a raw pointer, not `Send + Sync`, but it is created once by the
+/// UI thread, drawn read-only, and never freed — so sharing it is sound.
 struct AppIcon(HICON);
-// SAFETY: the icon is created once, accessed read-only for drawing, and lives
-// for the whole process; it is never modified, freed, or ownership-transferred.
 unsafe impl Send for AppIcon {}
 unsafe impl Sync for AppIcon {}
 static APP_ICON: std::sync::OnceLock<AppIcon> = std::sync::OnceLock::new();
+
+/// GDI fonts, created once and cached so `WM_PAINT` (which fires often while
+/// dragging) doesn't create and destroy an `HFONT` every time. Like the icon,
+/// they are read-only and live for the whole process.
+struct AppFont(HFONT);
+unsafe impl Send for AppFont {}
+unsafe impl Sync for AppFont {}
+
+/// Small (-12, normal) for labels / reset line / brand mark.
+static FONT_SMALL: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
+/// Big (-13, semibold) for the primary "used %" figures.
+static FONT_BIG: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
+/// Offline-state (-16, semibold) for the "Connecting..." line.
+static FONT_OFFLINE: std::sync::OnceLock<AppFont> = std::sync::OnceLock::new();
+
+/// Cached font for (height, weight), created on first use and never freed.
+fn cached_font(slot: &'static std::sync::OnceLock<AppFont>, height: i32, weight: i32) -> HFONT {
+    slot.get_or_init(|| AppFont(create_font(height, weight))).0
+}
 
 pub fn set_quota(q: Quota) {
     if let Some(m) = QUOTA.get() {
@@ -93,7 +109,7 @@ pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 235, LWA_ALPHA);
     }
 
-    // Rounded corners (12px) for a softer, more modern floating look.
+    // Rounded corners (12px radius) for a softer floating look.
     let rgn = unsafe { CreateRoundRectRgn(0, 0, w + 1, h + 1, 24, 24) };
     if !rgn.is_invalid() {
         unsafe {
@@ -101,8 +117,7 @@ pub fn create(hinstance: HINSTANCE) -> Result<Overlay> {
         }
     }
 
-    // Load the embedded app icon once so the offline state can draw it. The
-    // window procedure has no hinstance, so cache it here at creation time.
+    // Cache the embedded icon here; the window proc has no hinstance.
     let _ = APP_ICON.get_or_init(|| {
         AppIcon(unsafe { LoadIconW(hinstance, PCWSTR(1 as *const u16)) }.unwrap_or_default())
     });
@@ -118,8 +133,8 @@ extern "system" fn overlay_wndproc(
 ) -> LRESULT {
     match msg {
         WM_NCHITTEST => {
-            // Report the entire client area as the title bar so the user can
-            // drag the borderless window by holding anywhere on it.
+            // Treat the whole client area as the title bar so the window can be
+            // dragged by holding anywhere on it.
             LRESULT(HTCAPTION as isize)
         }
         WM_PAINT => {
@@ -128,8 +143,8 @@ extern "system" fn overlay_wndproc(
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_COMMAND => {
-            // Tray context-menu items are delivered to the overlay (the menu
-            // owner). Forward them to the main message loop for handling.
+            // Tray menu items are delivered to the overlay (the menu owner);
+            // forward them to the main message loop.
             let cmd = wparam.0 as u32 & 0xffff;
             if cmd == tray::CMD_REFRESH {
                 unsafe { let _ = PostMessageW(hwnd, WM_APP_REFRESH, WPARAM(0), LPARAM(0)); };
@@ -161,7 +176,7 @@ fn paint(hwnd: HWND) {
 
     let quota = QUOTA.get().map(|m| m.lock().unwrap().clone()).unwrap_or_default();
 
-    // ---- Background: deep charcoal, slightly rounded feel via window region.
+    // ---- Background: deep charcoal, slightly rounded via window region.
     let bg = rgb(24, 24, 30);
     unsafe { SetBkColor(hdc, bg) };
     unsafe {
@@ -170,10 +185,9 @@ fn paint(hwnd: HWND) {
     unsafe { SetDCBrushColor(hdc, bg) };
     unsafe { let _ = Rectangle(hdc, 0, 0, w, h); };
 
-    // Two fonts for visual hierarchy: a small one for labels/secondary text,
-    // and a larger one for the primary "used %" figures.
-    let small_font = create_font(-12, 400);
-    let big_font = create_font(-13, 550); // slightly bolder, primary figures
+    // Cached fonts (see above); small for labels, big (bolder) for the figures.
+    let small_font = cached_font(&FONT_SMALL, -12, 400);
+    let big_font = cached_font(&FONT_BIG, -13, 550);
     let small_old = unsafe { SelectObject(hdc, small_font) };
     unsafe { SetBkMode(hdc, TRANSPARENT) };
 
@@ -266,21 +280,17 @@ fn paint(hwnd: HWND) {
                 );
             }
         }
-        let offline_font = create_font(-16, 550);
+        let offline_font = cached_font(&FONT_OFFLINE, -16, 550);
         unsafe { SetTextColor(hdc, rgb(170, 172, 182)) };
         draw_centered(hdc, w, 68, "Connecting...", offline_font);
-        unsafe { let _ = DeleteObject(offline_font); };
     }
 
     unsafe { SelectObject(hdc, small_old) };
-    unsafe { let _ = DeleteObject(big_font); };
-    unsafe { let _ = DeleteObject(small_font); };
 
     unsafe { let _ = EndPaint(hwnd, &ps); };
 }
 
-/// Create a Segoe UI font at the given pixel height (negative = character height)
-/// and weight.
+/// Create a Segoe UI font at the given (negative) pixel height and weight.
 fn create_font(height: i32, weight: i32) -> HFONT {
     unsafe {
         CreateFontW(

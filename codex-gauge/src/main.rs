@@ -19,33 +19,29 @@ use std::sync::OnceLock;
 
 use crate::quota::Quota;
 
-const REFRESH_MS: u32 = 300_000; // 5 minutes
+const REFRESH_MS: u32 = 300_000; // 5 min
 const TIMER_REFRESH: usize = 1;
 const TIMER_STARTUP: usize = 2;
+const TIMER_WAKE_REFRESH: usize = 3;
 
-/// Overlay HWND (stored as a raw usize because HWND is not Send).
-/// The tray callback and startup refresh need it from the bus window proc.
+/// Overlay HWND as raw usize (HWND is not Send), read from the bus window proc.
 static OVERLAY_HWND: OnceLock<usize> = OnceLock::new();
 
-/// Guards against overlapping quota fetches. When network is slow/down, a
-/// fetch can stall beyond the 5-minute window; without this lock every timer
-/// tick would spawn a fresh codex subprocess concurrently (multiple children,
-/// UI redrawing each time one returns). Skips the new tick if one is running.
+/// Skips a refresh tick while a previous fetch is still running, so a slow
+/// network can't pile up overlapping `codex app-server` subprocesses.
 static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None) }?.into();
 
-    // Register the overlay window class.
     overlay::register_window_class(hinstance)?;
 
-    // Create a hidden message-only window as the tray/message dispatcher owner.
+    // A hidden message-only window owns the tray and timers.
     let bus = create_bus_window(hinstance)?;
 
-    // Create tray.
     tray::add(bus, hinstance)?;
 
-    // Create the overlay (hidden by default).
+    // Overlay, hidden until shown below.
     let overlay = match overlay::create(hinstance) {
         Ok(o) => o,
         Err(e) => {
@@ -54,18 +50,14 @@ fn main() -> Result<()> {
         }
     };
 
-    // Make the overlay handle available to the bus window proc (tray callbacks
-    // arrive there via SendMessage, not through the GetMessage queue).
+    // Expose the overlay HWND to the bus proc for tray callbacks.
     let _ = OVERLAY_HWND.set(overlay.hwnd.0 as usize);
 
-    // Show overlay on startup.
     unsafe { let _ = ShowWindow(overlay.hwnd, SW_SHOWNOACTIVATE); };
     unsafe { let _ = UpdateWindow(overlay.hwnd); };
 
-    // Kick off an immediate refresh shortly after startup.
-    unsafe { SetTimer(bus, TIMER_STARTUP, 500, None) };
-    // Periodic refresh.
-    unsafe { SetTimer(bus, TIMER_REFRESH, REFRESH_MS, None) };
+    unsafe { SetTimer(bus, TIMER_STARTUP, 500, None) }; // refresh shortly after startup
+    unsafe { SetTimer(bus, TIMER_REFRESH, REFRESH_MS, None) }; // periodic
 
     let mut msg = MSG::default();
     loop {
@@ -88,6 +80,21 @@ fn main() -> Result<()> {
                     refresh_async(overlay.hwnd);
                 } else if msg.wParam.0 == TIMER_REFRESH as usize {
                     refresh_async(overlay.hwnd);
+                } else if msg.wParam.0 == TIMER_WAKE_REFRESH as usize {
+                    unsafe { let _ = KillTimer(bus, TIMER_WAKE_REFRESH); };
+                    refresh_async(overlay.hwnd);
+                }
+            }
+            WM_POWERBROADCAST => {
+                // Resume from sleep: the 5-min timer may not have fired while
+                // asleep, so kick a delayed refresh (lets the network settle).
+                if msg.wParam.0 == PBT_APMRESUMEAUTOMATIC as usize
+                    || msg.wParam.0 == PBT_APMRESUMESUSPEND as usize
+                {
+                    unsafe {
+                        let _ = KillTimer(bus, TIMER_WAKE_REFRESH);
+                        let _ = SetTimer(bus, TIMER_WAKE_REFRESH, 2000, None);
+                    }
                 }
             }
             WM_COMMAND => {
@@ -112,7 +119,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// A hidden window that owns the tray and timers; overlay paints itself via its own HWND.
+/// Hidden window that owns the tray and timers.
 fn create_bus_window(hinstance: HINSTANCE) -> Result<HWND> {
     let class_name = w!("CodexGaugeBus");
     let wc = WNDCLASSW {
@@ -148,8 +155,7 @@ extern "system" fn bus_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == tray::WM_TRAY {
-        // Tray callbacks are delivered via SendMessage straight into this
-        // window proc (they never enter the GetMessage queue).
+        // Tray callbacks arrive via SendMessage directly in this proc.
         let overlay = HWND(*OVERLAY_HWND.get().unwrap_or(&0) as *mut std::ffi::c_void);
         handle_tray(lparam, overlay);
         return LRESULT(0);
@@ -173,8 +179,7 @@ fn handle_tray(lparam: LPARAM, overlay: HWND) {
             unsafe { let _ = RedrawWindow(overlay, None, None, RDW_INVALIDATE | RDW_UPDATENOW); };
         }
         WM_RBUTTONUP => {
-            // Use the overlay (a visible window) as the menu owner so the
-            // popup reliably gets the foreground and actually shows up.
+            // A visible owner window lets the popup reliably take the foreground.
             tray::show_menu(overlay);
         }
         _ => {}
@@ -182,17 +187,14 @@ fn handle_tray(lparam: LPARAM, overlay: HWND) {
 }
 
 fn refresh_async(overlay: HWND) {
-    // Skip if a previous fetch is still in flight (e.g. network stalled).
-    // This prevents spawning a new `codex app-server` subprocess on every
-    // timer tick during an outage or slow link — the main cause of the
-    // "keeps refreshing / connecting forever" symptom after reconnect.
+    // Skip if a previous fetch is still in flight.
     if REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
 
     // HWND is not Send; carry it as a raw integer across the thread boundary.
     let overlay_bits = overlay.0 as usize;
-    // Do the potentially-slow fetch off the UI thread, then repaint.
+    // Fetch off the UI thread, then repaint.
     std::thread::spawn(move || {
         let result = appserver::fetch_quota_async();
         let quota = match result {
@@ -204,7 +206,7 @@ fn refresh_async(overlay: HWND) {
         unsafe {
             let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW);
         }
-        // Clear the in-flight flag so the next timer tick can fetch again.
+        // Clear the in-flight flag so the next tick can fetch again.
         REFRESH_IN_FLIGHT.store(false, Ordering::Release);
     });
 }
